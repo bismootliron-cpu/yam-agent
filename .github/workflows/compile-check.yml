@@ -1,0 +1,85 @@
+name: Compile Check
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install deps
+        run: pip install requests
+
+      - name: Compile + shrink check
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          cat > /tmp/check.py << 'PYEOF'
+          import subprocess, sys, os, glob, requests
+
+          def compile_check():
+              errors = []
+              for f in glob.glob("**/*.py", recursive=True):
+                  if "venv" in f or "site-packages" in f:
+                      continue
+                  r = subprocess.run(["python", "-m", "py_compile", f], capture_output=True, text=True)
+                  if r.returncode != 0:
+                      errors.append(f"{f}:\n{r.stderr.strip()[:500]}")
+              return errors
+
+          def shrink_check():
+              warnings = []
+              diff = subprocess.run(["git", "diff", "--name-only", "HEAD^", "HEAD"],
+                                     capture_output=True, text=True).stdout.split()
+              for f in diff:
+                  if not f.endswith(".py"):
+                      continue
+                  old = subprocess.run(["git", "show", f"HEAD^:{f}"], capture_output=True, text=True)
+                  if old.returncode != 0:
+                      continue  # new file, nothing to compare
+                  old_lines = len(old.stdout.splitlines())
+                  if not os.path.exists(f):
+                      warnings.append(f"{f}: DELETED ({old_lines} -> 0 lines)")
+                      continue
+                  with open(f) as fh:
+                      new_lines = len(fh.readlines())
+                  if old_lines > 0:
+                      drop = (old_lines - new_lines) / old_lines * 100
+                      if drop >= 20:
+                          warnings.append(f"{f}: shrank {drop:.0f}% ({old_lines} -> {new_lines} lines)")
+              return warnings
+
+          errors = compile_check()
+          warnings = shrink_check()
+
+          if errors or warnings:
+              repo = os.environ.get("GITHUB_REPOSITORY", "?")
+              sha = os.environ.get("GITHUB_SHA", "?")[:7]
+              parts = [f"\u26a0\ufe0f {repo} \u2014 push check ({sha})"]
+              if errors:
+                  parts.append("\U0001F534 COMPILE FAILED:")
+                  parts.extend(errors)
+              if warnings:
+                  parts.append("\U0001F7E0 FILE SHRANK \u2014 needs manual review:")
+                  parts.extend(warnings)
+              text = "\n".join(parts)[:4000]
+              token = os.environ.get("TELEGRAM_BOT_TOKEN")
+              chat_id = os.environ.get("TELEGRAM_CHAT_ID")
+              if token and chat_id:
+                  requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
+                                 data={"chat_id": chat_id, "text": text})
+
+          if errors:
+              sys.exit(1)
+          PYEOF
+          python /tmp/check.py
