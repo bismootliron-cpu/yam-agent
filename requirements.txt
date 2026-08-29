@@ -1,3 +1,4 @@
 anthropic
 requests
 edge-tts
+supabase
